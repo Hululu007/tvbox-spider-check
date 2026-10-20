@@ -9,3 +9,5 @@ captures/
 *.apk
 *.aab
 state/
+__pycache__/
+*.pyc

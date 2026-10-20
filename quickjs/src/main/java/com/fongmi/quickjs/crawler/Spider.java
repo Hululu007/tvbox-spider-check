@@ -193,9 +193,29 @@ public class Spider extends com.github.catvod.crawler.Spider {
         // 源文本取不到时必须明确报错：否则 content.contains 会抛 NPE，掩盖真实原因
         if (TextUtils.isEmpty(content)) throw new Exception("读取 js 源失败（本地路径不存在或下载内容为空）：" + api);
         cat = content.contains("__jsEvalReturn");
+        // drpy 系源在 init 就要用 pdfh/pdfa/pd 等全局函数（FongMi 由站点 jar 的
+        // com.github.catvod.js.Function 注入）。测活 APK 不加载那个 jar，缺了会抛
+        // "UnhandledPromiseRejectionException: 'pdfh' is not defined"。只有源里真的
+        // 用到了才注入兼容层，避免每个站点都白编译一次 cheerio。
+        if (needsDrpyCompat(content)) installDrpyCompat();
         ctx.evaluateModule(content.replace(spider, global), api);
         ctx.evaluateModule(String.format(Asset.read("js/lib/spider.js"), api));
         jsObject = (JSObject) ctx.getProperty(ctx.getGlobalObject(), spider);
+    }
+
+    private static boolean needsDrpyCompat(String content) {
+        // 注意不能匹配 "pdfh(" —— drpy2.min.js 里 pdfh 是引用(defaultParser.pdfh)而不是调用，
+        // 带括号会漏判；提到名字就注入，代价只有一次 cheerio 编译。
+        return content.contains("pdfh") || content.contains("pdfa")
+                || content.contains("pdfv") || content.contains("pdfl");
+    }
+
+    private void installDrpyCompat() {
+        try {
+            ctx.evaluateModule(Asset.read("js/lib/drpy-compat.js"), "drpy-compat.js");
+        } catch (Throwable e) {
+            // 兼容层失败不阻断主流程：真缺函数时源自己会报错，错误信息仍能显示出来
+        }
     }
 
     private Object getExt(String ext) {

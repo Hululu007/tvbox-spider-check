@@ -35,11 +35,14 @@ public class Checker {
     public static final int DEPTH_DETAIL = 3;
     public static final int DEPTH_PLAY = 4;
 
-    private static final int T_HOME = 12;
-    private static final int T_CAT = 10;
-    private static final int T_DETAIL = 12;
-    private static final int T_PLAY = 12;
+    private static final int T_HOME = 15;
+    private static final int T_CAT = 12;
+    private static final int T_DETAIL = 15;
+    // py 源的播放解析常要先登录/签名/解密，12 秒不够（实测有源要 17s）
+    private static final int T_PLAY = 20;
     private static final int T_HTTP = 15;
+    /** 苹果 CMS 接口首屏可能不给内容，这几个参数形态轮流试一次 */
+    private static final String[] HOME_QUERIES = {"ac=list", "ac=videolist&pg=1", "ac=detail&pg=1"};
 
     private static final ExecutorService TIMER = Executors.newCachedThreadPool();
 
@@ -89,22 +92,33 @@ public class Checker {
         JSONObject h = toJson(body);
         if (h == null) {
             site.setGrade("D");
-            site.setResult("返回非 JSON：" + snippet(body));
+            site.setResult("接口" + whyNotJson(body));
             return;
         }
         boolean home = false;
         String catErr = "", detailErr = "", playInfo = "未测", firstId = "", firstTid = "";
-        JSONArray cls = h.optJSONArray("class");
-        JSONArray list = h.optJSONArray("list");
-        JSONArray vlist = h.optJSONArray("vod_list");
-        if (list == null) list = vlist;
-        if (cls != null && cls.length() > 0) {
-            firstTid = cls.optJSONObject(0).optString("type_id");
-            home = true;
-        }
-        if (list != null && list.length() > 0) {
-            home = true;
-            firstId = firstOf(list);
+        String[] picked = pickOne(h);
+        firstTid = picked[0];
+        firstId = picked[1];
+        home = !TextUtils.isEmpty(firstTid) || !TextUtils.isEmpty(firstId);
+        if (!home) {
+            // 苹果 CMS 家族各家参数不一：首屏没给 class/list 时再显式问一次，
+            // 否则会把「要带 ac=list 才有内容」的接口误判成 D 级空接口
+            for (String q : HOME_QUERIES) {
+                try {
+                    String url = join(api, q);
+                    JSONObject alt = toJson(call(() -> http(url), T_HTTP, "接口"));
+                    String[] again = pickOne(alt);
+                    if (!TextUtils.isEmpty(again[0]) || !TextUtils.isEmpty(again[1])) {
+                        h = alt;
+                        firstTid = again[0];
+                        firstId = again[1];
+                        home = true;
+                        break;
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
         }
         if (!home) {
             String msg = h.optString("msg", "");
@@ -120,17 +134,24 @@ public class Checker {
             if (TextUtils.isEmpty(firstTid)) {
                 catErr = "无 type_id";
             } else {
-                String url = join(api, "ac=videolist&t=" + firstTid + "&pg=1");
-                try {
-                    JSONObject c = toJson(call(() -> http(url), T_HTTP, "分类"));
-                    JSONArray cl = c == null ? null : c.optJSONArray("list");
-                    if (cl == null) cl = c == null ? null : c.optJSONArray("vod_list");
-                    if (cl != null && cl.length() > 0) {
-                        category = true;
-                        if (TextUtils.isEmpty(firstId)) firstId = firstOf(cl);
-                    } else catErr = "分类无 list";
-                } catch (Throwable e) {
-                    catErr = msg(e);
+                // 分类接口参数各家不同（ac=videolist/detail/list，t/type_id），逐个试
+                for (String q : new String[]{"ac=videolist&t=" + firstTid + "&pg=1",
+                        "ac=detail&t=" + firstTid + "&pg=1",
+                        "ac=list&t=" + firstTid + "&pg=1",
+                        "ac=videolist&t=" + firstTid}) {
+                    try {
+                        String url = join(api, q);
+                        JSONObject c = toJson(call(() -> http(url), T_HTTP, "分类"));
+                        JSONArray cl = listOf(c);
+                        if (cl != null && cl.length() > 0) {
+                            category = true;
+                            if (TextUtils.isEmpty(firstId)) firstId = firstOf(cl);
+                            break;
+                        }
+                        catErr = "分类无 list";
+                    } catch (Throwable e) {
+                        catErr = msg(e);
+                    }
                 }
             }
         }
@@ -140,24 +161,30 @@ public class Checker {
             if (TextUtils.isEmpty(firstId)) {
                 detailErr = "无 vod_id";
             } else {
-                String url = join(api, "ac=detail&ids=" + firstId);
-                try {
-                    JSONObject d = toJson(call(() -> http(url), T_HTTP, "详情"));
-                    JSONArray dl = d == null ? null : d.optJSONArray("list");
-                    if (dl == null) dl = d == null ? null : d.optJSONArray("vod_list");
-                    if (dl == null || dl.length() == 0) {
-                        detailErr = "详情无 list";
-                    } else {
-                        String pu = dl.optJSONObject(0).optString("vod_play_url");
-                        if (TextUtils.isEmpty(pu)) detailErr = "vod_play_url 空";
-                        else {
-                            detail = true;
-                            play = true; // CMS 接口给出播放地址即视为可播（App 负责解析）
-                            playInfo = "CMS 直出";
+                // 详情参数同样不同（ids / id），且有的接口要 ac=videolist
+                for (String q : new String[]{"ac=detail&ids=" + firstId,
+                        "ac=videolist&ids=" + firstId,
+                        "ac=detail&id=" + firstId}) {
+                    try {
+                        String url = join(api, q);
+                        JSONObject d = toJson(call(() -> http(url), T_HTTP, "详情"));
+                        JSONArray dl = listOf(d);
+                        if (dl == null || dl.length() == 0) {
+                            detailErr = "详情无 list";
+                            continue;
                         }
+                        String pu = dl.optJSONObject(0).optString("vod_play_url");
+                        if (TextUtils.isEmpty(pu)) {
+                            detailErr = "vod_play_url 空";
+                            continue;
+                        }
+                        detail = true;
+                        play = true; // CMS 接口给出播放地址即视为可播（App 负责解析）
+                        playInfo = "CMS 直出";
+                        break;
+                    } catch (Throwable e) {
+                        detailErr = msg(e);
                     }
-                } catch (Throwable e) {
-                    detailErr = msg(e);
                 }
             }
         }
@@ -195,8 +222,9 @@ public class Checker {
 
         // ---- 首页 ----
         try {
-            JSONObject h = toJson(call(() -> spider.homeContent(true), T_HOME, "首页"));
-            if (h == null) throw new Exception("返回非 JSON");
+            String raw = call(() -> spider.homeContent(true), T_HOME, "首页");
+            JSONObject h = toJson(raw);
+            if (h == null) throw new Exception(whyNotJson(raw));
             JSONArray cls = h.optJSONArray("class");
             JSONArray list = h.optJSONArray("list");
             if (cls != null && cls.length() > 0) {
@@ -405,6 +433,33 @@ public class Checker {
         return api + (api.contains("?") ? "&" : "?") + q;
     }
 
+    /** 取 list 数组，兼容 list / vod_list / data 三种键名 */
+    private static JSONArray listOf(JSONObject o) {
+        if (o == null) return null;
+        JSONArray list = o.optJSONArray("list");
+        if (list == null) list = o.optJSONArray("vod_list");
+        if (list == null) list = o.optJSONArray("data");
+        return list;
+    }
+
+    /** 从接口响应里挑第一组「分类 id / 影片 id」 */
+    private static String[] pickOne(JSONObject o) {
+        String tid = "", id = "";
+        if (o == null) return new String[]{tid, id};
+        JSONArray cls = o.optJSONArray("class");
+        if (cls == null) cls = o.optJSONArray("class_list");
+        if (cls != null && cls.length() > 0) {
+            JSONObject first = cls.optJSONObject(0);
+            if (first != null) {
+                tid = first.optString("type_id", "");
+                if (TextUtils.isEmpty(tid)) tid = first.optString("id", "");
+            }
+        }
+        JSONArray list = listOf(o);
+        if (list != null && list.length() > 0) id = firstOf(list);
+        return new String[]{tid, id};
+    }
+
     private static String firstOf(JSONArray arr) {
         for (int i = 0; i < arr.length(); i++) {
             JSONObject o = arr.optJSONObject(i);
@@ -425,6 +480,22 @@ public class Checker {
         } catch (Throwable e) {
             return null;
         }
+    }
+
+    /**
+     * toJson 失败时的可读原因。必须区分「真返回了别的东西」和「返回 null」：
+     * py 源普遍写 `except: self.host = ''` 静默吞错，最后 homeContent 返回 None，
+     * 一律显示「返回非 JSON」会让人以为是格式问题，其实多半是 init 没成功
+     * （宿主缓存接口缺失、接口/登录失败等）。
+     */
+    private static String whyNotJson(String raw) {
+        if (raw == null) return "源返回空（null）";
+        String t = raw.trim();
+        if (t.isEmpty()) return "源返回空字符串";
+        if (t.equals("null") || t.equals("None")) return "源返回 null（多半 init 未成功：host 为空或接口/登录失败）";
+        if (t.startsWith("[")) return "源返回数组（应为对象）：" + snippet(t);
+        if (t.startsWith("\"")) return "源返回字符串：" + snippet(t);
+        return "返回非 JSON：" + snippet(t);
     }
 
     private static String snippet(String body) {
